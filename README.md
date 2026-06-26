@@ -19,10 +19,11 @@ We miss too much valuable clues about epigenetic ***stability*** and ***diversit
 We here provide an ultrafast, Rust-based bioinformatics tool for the computation of various intra-/inter-cellular methylation heterogeneity measures.
 
 ## Installation
-Install with `conda`.
+Install locally
 ```
-conda install -c dohlee metheor
+cargo build --release
 ```
+The compiled binary will be at `target/release/metheor`
 
 ## Usage
 
