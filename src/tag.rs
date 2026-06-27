@@ -9,13 +9,10 @@ use std::cmp::{max, min};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str;
+use std::sync::{mpsc, Arc};
+use std::thread;
 
 use crate::bamutil;
-
-fn need_reverse_complement(read: &Record) -> bool {
-    !((!read.is_reverse() && read.is_first_in_template())
-        || (read.is_reverse() && read.is_last_in_template()))
-}
 
 fn reverse_complement(seq: &str, rcmapping: &HashMap<char, char>) -> String {
     let mut res: String = String::with_capacity(seq.len());
@@ -99,55 +96,63 @@ pub fn get_rcmapping() -> HashMap<char, char> {
     rcmapping
 }
 
-// fn process_match(
-//     tmp_read_seq: Vec<char>,
-//     tmp_ref_seq: Vec<char>,
-//     read_seq: String,
-//     ref_seq: String,
-//     used_read_len: &mut usize,
-//     used_ref_len: &mut usize,
-//     length: &mut u32,
-// ) -> () {
-//     tmp_read_seq.append(
-//         &mut read_seq
-//             .chars()
-//             .skip(used_read_len)
-//             .take(*length as usize)
-//             .collect(),
-//     );
-//     tmp_ref_seq.append(
-//         &mut ref_seq
-//             .chars()
-//             .skip(used_ref_len)
-//             .take(*length as usize)
-//             .collect(),
-//     );
+/// Lightweight payload extracted from a Record, containing only the fields
+/// needed for XM tag computation. This is Send + Sync so it can cross thread boundaries.
+#[derive(Clone)]
+struct ReadPayload {
+    tid: i32,
+    reference_start: i64,
+    reference_end: i64,
+    seq_bytes: Vec<u8>,
+    cigar_ops: Vec<Cigar>,
+    is_reverse: bool,
+    is_first_in_template: bool,
+    is_last_in_template: bool,
+}
 
-//     *used_read_len += *length as usize;
-//     *used_ref_len += *length as usize;
-// }
+impl ReadPayload {
+    fn from_record(r: &Record) -> Self {
+        Self {
+            tid: r.tid(),
+            reference_start: r.reference_start(),
+            reference_end: r.reference_end(),
+            seq_bytes: r.seq().as_bytes().to_vec(),
+            cigar_ops: r.cigar().iter().copied().collect(),
+            is_reverse: r.is_reverse(),
+            is_first_in_template: r.is_first_in_template(),
+            is_last_in_template: r.is_last_in_template(),
+        }
+    }
+}
 
-pub fn determine_xm_tag_string(
-    r: &Record,
+/// Compute XM tag string from a ReadPayload (used by worker threads).
+fn compute_xm_tag_from_payload(
+    payload: &ReadPayload,
     refgenome: &HashMap<usize, Vec<u8>>,
     tid2size: &HashMap<usize, usize>,
     rcmapping: &HashMap<char, char>,
     is_paired_end: bool,
 ) -> String {
-    let tid = r.tid();
-    let start = r.reference_start();
-    let end = r.reference_end();
+    let tid = payload.tid;
+    let start = payload.reference_start;
+    let end = payload.reference_end;
 
+    // Reverse-complement decision (same logic as need_reverse_complement for paired-end,
+    // but extracting the needed flags from payload)
     let flag_reverse_complement = match is_paired_end {
-        true => need_reverse_complement(r),
-        false => r.is_reverse(),
+        true => {
+            !((!payload.is_reverse && payload.is_first_in_template)
+                || (payload.is_reverse && payload.is_last_in_template))
+        }
+        false => payload.is_reverse,
     };
 
-    // Extract read sequence from alignment record.
-    let read_seq = match str::from_utf8(&r.seq().as_bytes()) {
+    // Extract read sequence from payload.
+    let read_seq = match str::from_utf8(&payload.seq_bytes) {
         Ok(read_seq) => read_seq.to_string().to_uppercase(),
         Err(error) => panic!("Error parsing alignment record: {}", error),
     };
+
     // For reference sequence,
     // we should additionally consider upstream & downstream 2-bp positions,
     // to determine the cytosine context near the left & right edge of the alignment.
@@ -183,7 +188,7 @@ pub fn determine_xm_tag_string(
     let mut used_read_len: usize = 0;
     let mut used_ref_len: usize = 2;
 
-    for cigar in r.cigar().iter() {
+    for cigar in payload.cigar_ops.iter() {
         match cigar {
             Cigar::Match(length) => {
                 tmp_read_seq.append(
@@ -383,7 +388,22 @@ pub fn determine_xm_tag_string(
     }
 }
 
-pub fn run(input: &str, output: &str, genome: &str) {
+/// Original determine_xm_tag_string (kept for backward compatibility and single-threaded path).
+/// Delegates to compute_xm_tag_from_payload after extracting fields from the Record.
+pub fn determine_xm_tag_string(
+    r: &Record,
+    refgenome: &HashMap<usize, Vec<u8>>,
+    tid2size: &HashMap<usize, usize>,
+    rcmapping: &HashMap<char, char>,
+    is_paired_end: bool,
+) -> String {
+    let payload = ReadPayload::from_record(r);
+    compute_xm_tag_from_payload(&payload, refgenome, tid2size, rcmapping, is_paired_end)
+}
+
+/// Single-threaded implementation. Reads BAM, processes each record sequentially,
+/// writes output BAM with XM tag.
+fn run_helper(input: &str, output: &str, genome: &str) {
     let mut reader = bamutil::get_reader(input);
     let is_paired_end = bamutil::is_paired_end(input);
     let header = bamutil::get_header(&reader);
@@ -442,6 +462,143 @@ pub fn run(input: &str, output: &str, genome: &str) {
     }
 }
 
+/// Multi-threaded implementation using channel-based worker pool.
+/// Produces exactly the same results as `run_helper`.
+fn run_helper_mt(input: &str, output: &str, genome: &str, threads: usize) {
+    let mut reader = bamutil::get_reader(input);
+    let is_paired_end = bamutil::is_paired_end(input);
+    let header = bamutil::get_header(&reader);
+    let tid2size: HashMap<usize, usize> = get_tid2size_from_bam(input);
+
+    let rcmapping = get_rcmapping();
+
+    // Assert if the output directory exists.
+    let path = PathBuf::from(&output);
+    let dir = path.parent().unwrap();
+
+    if !dir.is_dir() {
+        panic!(
+            "No such directory for output alignment file: {}",
+            dir.to_str().unwrap()
+        )
+    }
+    // Prepare output writer.
+    let header_tmpl = get_header_template_from_bam(input);
+    let mut writer = match bam::Writer::from_path(output, &header_tmpl, bam::Format::Bam) {
+        Ok(writer) => writer,
+        Err(error) => panic!("Error opening alignment file to write: {}", error),
+    };
+    // Prepare reference genome.
+    let refgenome_reader = match faidx::Reader::from_path(genome) {
+        Ok(refgenome_reader) => refgenome_reader,
+        Err(error) => {
+            panic!("Error opening reference genome file: {}", error);
+        }
+    };
+    println!("Parsing reference genome...");
+    let mut refgenome: HashMap<usize, Vec<u8>> = HashMap::new();
+    for (tid, _size) in tid2size.iter() {
+        let ref_array = refgenome_reader
+            .fetch_seq(bamutil::tid2chrom(*tid as i32, &header), 0, tid2size[tid])
+            .expect("Error fetching reference genome sequence.");
+
+        refgenome.insert(*tid, ref_array);
+    }
+    println!("Done!");
+
+    // Wrap read-only data in Arc for sharing across threads.
+    let refgenome = Arc::new(refgenome);
+    let tid2size = Arc::new(tid2size);
+    let rcmapping = Arc::new(rcmapping);
+
+    // Collect all records and payloads first.
+    // This is necessary because Record is not Clone/Send, so we extract payloads
+    // for workers and keep records for writing in correct order.
+    println!("Reading alignment records...");
+    let mut records: Vec<Record> = Vec::new();
+    let mut payloads: Vec<ReadPayload> = Vec::new();
+    for r in reader.records().map(|r| r.unwrap()) {
+        payloads.push(ReadPayload::from_record(&r));
+        records.push(r);
+    }
+    println!("Loaded {} records.", records.len());
+
+    let total_records = records.len();
+
+    // Create channels: workers receive Option<(usize, ReadPayload)>, send back (usize, String)
+    let mut txs: Vec<mpsc::SyncSender<Option<(usize, ReadPayload)>>> = Vec::with_capacity(threads);
+
+    let workers: Vec<thread::JoinHandle<Vec<(usize, String)>>> = (0..threads)
+        .map(|_| {
+            let (tx, rx) = mpsc::sync_channel::<Option<(usize, ReadPayload)>>(4);
+            txs.push(tx);
+            let refgenome = Arc::clone(&refgenome);
+            let tid2size = Arc::clone(&tid2size);
+            let rcmapping = Arc::clone(&rcmapping);
+            thread::spawn(move || {
+                let mut local_results: Vec<(usize, String)> = Vec::new();
+                while let Some((idx, payload)) = rx.recv().unwrap() {
+                    let xm_tag = compute_xm_tag_from_payload(
+                        &payload,
+                        &refgenome,
+                        &tid2size,
+                        &rcmapping,
+                        is_paired_end,
+                    );
+                    local_results.push((idx, xm_tag));
+                }
+                local_results
+            })
+        })
+        .collect();
+
+    // Dispatch work: round-robin distribution of payload indices.
+    let mut worker_idx: usize = 0;
+    for (i, payload) in payloads.into_iter().enumerate() {
+        txs[worker_idx]
+            .send(Some((i, payload)))
+            .expect("Error sending to worker thread");
+        worker_idx = (worker_idx + 1) % threads;
+    }
+
+    // Signal all workers to finish.
+    for tx in &txs {
+        tx.send(None).expect("Error sending termination signal");
+    }
+
+    // Collect results from all workers and place into ordered Vec.
+    let mut xm_tags: Vec<Option<String>> = vec![None; total_records];
+    for worker in workers {
+        let local_results = worker.join().expect("Worker thread panicked");
+        for (idx, xm_tag) in local_results {
+            xm_tags[idx] = Some(xm_tag);
+        }
+    }
+
+    // Apply XM tags to records in original order and write.
+    println!("Writing tagged records...");
+    for (i, mut r) in records.into_iter().enumerate() {
+        let xm_tag_string = xm_tags[i]
+            .as_ref()
+            .expect("Missing XM tag for record index");
+        let add_result = r.push_aux("XM".as_bytes(), Aux::String(xm_tag_string));
+        match add_result {
+            Ok(_) => (),
+            Err(e) => panic!("Error adding XM tag to alignment record. {}", e),
+        }
+        writer.write(&r).expect("Error writing to output file.");
+    }
+    println!("Done writing!");
+}
+
+pub fn run(input: &str, output: &str, genome: &str, threads: usize) {
+    if threads <= 1 {
+        run_helper(input, output, genome);
+    } else {
+        run_helper_mt(input, output, genome, threads);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,6 +615,7 @@ mod tests {
             "tests/test1.bam",
             "tests/no_such_directory/out.bam",
             "tests/tinyref.fa",
+            1,
         )
     }
     #[test]
@@ -467,6 +625,37 @@ mod tests {
             "tests/test1.bam",
             "tests/out.tagged.bam",
             "tests/there_is_no_such.fa",
+            1,
         )
+    }
+
+    #[test]
+    fn test_mt_matches_st() {
+        // Verify that multi-threaded produces the same tagged BAM as single-threaded.
+        use std::process::Command;
+
+        let input = "tests/test1.bam";
+        let genome = "tests/tinyref.fa";
+
+        // Run single-threaded
+        run(input, "tests/out.tagged.bam", genome, 1);
+
+        // Run multi-threaded
+        run(input, "tests/out.tagged.mt.bam", genome, 4);
+
+        // Compare BAM files using samtools view
+        let st_output = Command::new("samtools")
+            .args(["view", "tests/out.tagged.bam"])
+            .output()
+            .expect("Failed to run samtools view on ST output");
+        let mt_output = Command::new("samtools")
+            .args(["view", "tests/out.tagged.mt.bam"])
+            .output()
+            .expect("Failed to run samtools view on MT output");
+
+        assert_eq!(
+            st_output.stdout, mt_output.stdout,
+            "Single-threaded and multi-threaded BAM outputs differ"
+        );
     }
 }

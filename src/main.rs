@@ -116,8 +116,9 @@ fn main() {
             input,
             output,
             genome,
+            threads,
         } => {
-            tag::run(input, output, genome);
+            tag::run(input, output, genome, *threads);
         }
     }
 }
