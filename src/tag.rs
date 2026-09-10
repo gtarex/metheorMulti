@@ -176,6 +176,36 @@ fn compute_xm_tag_from_payload(
         padding[pad_nbases_start], ref_seq, padding[pad_nbases_end]
     );
 
+    // Separate leading and trailing soft-clips from aligned operations.
+    // Soft-clipped bases do not align to the reference genome and must be marked with '.' in XM.
+    // Keeping soft-clips separate prevents inserting '-' into the reference sequence,
+    // which would otherwise sever true adjacent CpG (CG) contexts at alignment boundaries.
+    let mut leading_clip: usize = 0;
+    let mut trailing_clip: usize = 0;
+    let mut aligned_cigar_ops: Vec<Cigar> = Vec::new();
+
+    for &cigar in payload.cigar_ops.iter() {
+        match cigar {
+            Cigar::SoftClip(length) => {
+                if aligned_cigar_ops.is_empty() {
+                    leading_clip += length as usize;
+                } else {
+                    trailing_clip += length as usize;
+                }
+            }
+            Cigar::HardClip(_) => {}
+            other => {
+                aligned_cigar_ops.push(other);
+            }
+        }
+    }
+
+    if aligned_cigar_ops.is_empty() {
+        return std::iter::repeat('.').take(read_seq.len()).collect();
+    }
+
+    let aligned_read_seq = &read_seq[leading_clip..read_seq.len() - trailing_clip];
+
     let mut tmp_read_seq: Vec<char> = Vec::new();
     let mut tmp_ref_seq: Vec<char> = Vec::new();
 
@@ -188,11 +218,11 @@ fn compute_xm_tag_from_payload(
     let mut used_read_len: usize = 0;
     let mut used_ref_len: usize = 2;
 
-    for cigar in payload.cigar_ops.iter() {
+    for cigar in aligned_cigar_ops.iter() {
         match cigar {
-            Cigar::Match(length) => {
+            Cigar::Match(length) | Cigar::Equal(length) | Cigar::Diff(length) => {
                 tmp_read_seq.append(
-                    &mut read_seq
+                    &mut aligned_read_seq
                         .chars()
                         .skip(used_read_len)
                         .take(*length as usize)
@@ -211,18 +241,18 @@ fn compute_xm_tag_from_payload(
             }
             Cigar::Ins(length) => {
                 tmp_read_seq.append(
-                    &mut read_seq
+                    &mut aligned_read_seq
                         .chars()
                         .skip(used_read_len)
                         .take(*length as usize)
                         .collect(),
                 );
-                tmp_ref_seq.extend(std::iter::repeat_n('-', *length as usize));
+                tmp_ref_seq.extend(std::iter::repeat('-').take(*length as usize));
 
                 used_read_len += *length as usize;
             }
             Cigar::Del(length) => {
-                tmp_read_seq.extend(std::iter::repeat_n('-', *length as usize));
+                tmp_read_seq.extend(std::iter::repeat('-').take(*length as usize));
                 tmp_ref_seq.append(
                     &mut ref_seq
                         .chars()
@@ -382,10 +412,20 @@ fn compute_xm_tag_from_payload(
         }
     }
 
-    match flag_reverse_complement {
+    let aligned_xm: String = match flag_reverse_complement {
         true => xm_tag.iter().rev().collect::<String>(),
         false => xm_tag.iter().collect::<String>(),
+    };
+
+    let mut full_xm = String::with_capacity(read_seq.len());
+    for _ in 0..leading_clip {
+        full_xm.push('.');
     }
+    full_xm.push_str(&aligned_xm);
+    for _ in 0..trailing_clip {
+        full_xm.push('.');
+    }
+    full_xm
 }
 
 /// Original determine_xm_tag_string (kept for backward compatibility and single-threaded path).

@@ -76,4 +76,3 @@ subcommands:
                 long: min-depth
                 takes_value: true
                 default_value: "10"
-        

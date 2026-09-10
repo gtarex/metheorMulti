@@ -157,10 +157,14 @@ pub fn compute(
         .truncate(true)
         .open(output)
         .unwrap();
-    for stat in result.values() {
-        if stat.get_read_depth() < min_depth {
-            continue;
-        }
+
+    let mut to_write: Vec<&QuartetStat> = result
+        .values()
+        .filter(|stat| stat.get_read_depth() >= min_depth)
+        .collect();
+    to_write.sort_by_key(|s| (s.pos1.tid, s.pos1.pos, s.pos2.pos, s.pos3.pos, s.pos4.pos));
+
+    for stat in to_write {
         writeln!(out, "{}", stat.to_bedgraph_field(&header))
             .expect("Error writing to output file.");
     }

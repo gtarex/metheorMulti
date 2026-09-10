@@ -1,0 +1,68 @@
+================================================================================
+                    metheorMultiV2 - Minimal Surgical Bug Fixes
+================================================================================
+
+Target: metheorMultiV2 (directly faithful to metheorMulti)
+
+1. DESIGN PRINCIPLE
+--------------------------------------------------------------------------------
+Follow the original architecture and dataflow of metheorMulti strictly.
+Avoid any artificial over-engineering (no custom streaming sliding windows,
+no complex chunk batching channels). Keep modifications minimal, clear, and
+focused strictly on fixing the two true bugs in upstream metheor.
+
+
+2. THE TWO TRUE BUGS & SURGICAL FIXES
+--------------------------------------------------------------------------------
+
+[Fix 1] Strand & Coordinate Determination (src/readutil.rs)
+- Original Bug:
+  `if (r.flags() == 0) || (r.flags() == 99) || (r.flags() == 147)`
+  used strict integer equality. Reads carrying composite flags (e.g. duplicate
+  bit 0x400 -> Flag 1123, or supplementary/secondary bits) failed the check and
+  wrongly fell into the reverse-strand branch ((abspos - 1)), shifting genomic
+  coordinates by 1bp and destroying CpG concordance. In addition, Bismark's
+  explicit conversion tag `XG` was ignored.
+- Minimal Fix:
+  1. If Bismark `XG` tag is present: "CT" -> OT (top strand), "GA" -> OB (bottom strand).
+  2. Fallback: Bitwise flag queries `(!r.is_reverse() && r.is_first_in_template()) || (r.is_reverse() && r.is_last_in_template())`
+     for paired-end, or `!r.is_reverse()` for single-end.
+
+
+[Fix 2] CIGAR Soft-Clip & Extended Match Handling (src/tag.rs)
+- Original Bug:
+  When parsing CIGAR, `Cigar::SoftClip` was caught by `_ => {}`, leaving
+  `used_read_len` unadvanced. This caused:
+  1. The read sequence to align out-of-phase against the reference genome.
+  2. The generated `XM` string to be shorter than the actual read.
+  Also, CIGAR `=` (`Cigar::Equal`) and `X` (`Cigar::Diff`) were unhandled.
+- Minimal Fix:
+  1. Recognize `Cigar::Equal` and `Cigar::Diff` alongside `Cigar::Match`.
+  2. Separate leading and trailing soft clips from the aligned portion:
+     - The aligned read slice `read_seq[leading..len - trailing]` is aligned
+       against the undisturbed genomic reference sequence, fully preserving
+       natural CpG dinucleotide context at boundaries.
+     - Soft-clipped bases are prepended and appended as '.' in the final XM string,
+       ensuring XM length matches read length exactly.
+
+
+3. ME ENTROPY CALCULATION (src/me.rs)
+--------------------------------------------------------------------------------
+- Retained the exact original `metheorMulti` accumulation logic:
+  Accumulates 4-CpG patterns into `HashMap<readutil::Quartet, QuartetStat>`
+  (single-threaded `compute_helper` for `-t 1`, multi-threaded `compute_helper_mt`
+  for `-t > 1`).
+- Preserved the full 22-column TSV format (chrom, pos1..4, me, c0..c15).
+- Added a simple 3-line coordinate sort (`sort_by_key`) right before writing output,
+  ensuring output rows are strictly and deterministically ordered by genomic coordinate.
+
+
+4. COMPILATION
+--------------------------------------------------------------------------------
+To compile release binary:
+    cd /mnt/md128/liyy/work/ageMethy2026/code/metheorMultiV2
+    cargo build --release
+
+Copy to test path:
+    cp /mnt/md128/liyy/work/ageMethy2026/code/metheorMultiV2/target/release/metheor /home/liyy/localTools/metheorV2/metheor
+================================================================================

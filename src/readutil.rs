@@ -323,21 +323,31 @@ impl Clone for CpGPosition {
 fn get_cpgs(r: &Record, xm: &str) -> Vec<CpG> {
     let mut cpgs: Vec<CpG> = Vec::new();
 
+    // Determine strand orientation:
+    // 1. If Bismark's XG tag is present: "CT" = OT (Watson, top strand), "GA" = OB (Crick, bottom strand).
+    // 2. Otherwise fall back to bitwise flags (handles SE and PE, with any flag bits like duplicates):
+    let is_ot = if let Ok(Aux::String(xg)) = r.aux(b"XG") {
+        xg == "CT"
+    } else if r.is_paired() {
+        (!r.is_reverse() && r.is_first_in_template())
+            || (r.is_reverse() && r.is_last_in_template())
+    } else {
+        !r.is_reverse()
+    };
+
     for (relpos, (abspos, c)) in r.reference_positions_full().zip(xm.chars()).enumerate() {
         if (c != 'z') && (c != 'Z') {
             continue;
         }
 
         if let Some(abspos) = abspos {
-            if (r.flags() == 0) || (r.flags() == 99) || (r.flags() == 147) {
-                // Forward
-                let cpgpos = CpGPosition::new(r.tid(), abspos as i32);
-                cpgs.push(CpG::new(relpos as i32, cpgpos, c));
+            let cpg_pos = if is_ot {
+                abspos as i32
             } else {
-                // Reverse
-                let cpgpos = CpGPosition::new(r.tid(), (abspos - 1) as i32);
-                cpgs.push(CpG::new(relpos as i32, cpgpos, c));
-            }
+                (abspos - 1) as i32
+            };
+            let cpgpos = CpGPosition::new(r.tid(), cpg_pos);
+            cpgs.push(CpG::new(relpos as i32, cpgpos, c));
         }
     }
 

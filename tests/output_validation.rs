@@ -274,8 +274,8 @@ mod output_validation_tests {
         let content = fs::read_to_string(output_file)?;
         assert!(!content.is_empty());
 
-        // ME typically outputs 6 columns (chr, start, end, pos1, pos2, me_value)
-        validate_output_structure(output_file, 6)?;
+        // metheorMulti/metheorMultiV2 outputs 22 columns (chr, pos1, pos2, pos3, pos4, me, c0..c15)
+        validate_output_structure(output_file, 22)?;
 
         // Validate ME values are in valid range (last column)
         let lines: Vec<&str> = content.lines().collect();
