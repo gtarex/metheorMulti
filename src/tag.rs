@@ -502,8 +502,132 @@ fn run_helper(input: &str, output: &str, genome: &str) {
     }
 }
 
-/// Multi-threaded implementation using channel-based worker pool.
-/// Produces exactly the same results as `run_helper`.
+const BATCH_SIZE: usize = 8192;
+
+// Decompression, calculation, compression, main/I/O threads.
+fn thread_allocation(threads: usize) -> (usize, usize, usize, usize) {
+    assert!((1..=100).contains(&threads), "threads must be from 1 to 100");
+    match threads {
+        1..=2 => (0, 0, 0, 1),
+        3..=7 => (0, threads - 2, 0, 2),
+        _ => {
+            let remaining = threads - 4;
+            let decompress = (remaining / 10).max(1).min(8);
+            let compress = (remaining - decompress) / 2;
+            (decompress, remaining - decompress - compress, compress, 4)
+        }
+    }
+}
+
+/// One bounded input/output channel per worker; consume in dispatch order.
+/// Record ownership moves between stages, with no whole-file accumulation.
+fn stream_batches<I, F, W>(
+    records: I,
+    workers: usize,
+    batch_size: usize,
+    transform: F,
+    mut write: W,
+) -> Result<(), String>
+where
+    I: Iterator<Item = Result<Record, String>> + Send,
+    F: Fn(&mut Record) -> Result<(), String> + Sync,
+    W: FnMut(&Record) -> Result<(), String>,
+{
+    assert!(workers > 0 && batch_size > 0);
+    thread::scope(|scope| {
+        let mut inputs = Vec::with_capacity(workers);
+        let mut outputs = Vec::with_capacity(workers);
+        let mut handles = Vec::with_capacity(workers);
+
+        for _ in 0..workers {
+            let (input_tx, input_rx) = mpsc::sync_channel::<(usize, Vec<Record>)>(1);
+            let (output_tx, output_rx) = mpsc::sync_channel::<(usize, Vec<Record>)>(1);
+            inputs.push(input_tx);
+            outputs.push(output_rx);
+            let transform = &transform;
+            handles.push(scope.spawn(move || -> Result<(), String> {
+                while let Ok((index, mut batch)) = input_rx.recv() {
+                    for record in &mut batch {
+                        transform(record)?;
+                    }
+                    output_tx.send((index, batch))
+                        .map_err(|_| "Tag output channel disconnected".to_string())?;
+                }
+                Ok(())
+            }));
+        }
+
+        let reader = scope.spawn(move || -> Result<usize, String> {
+            let mut index = 0;
+            let mut batch = Vec::with_capacity(batch_size);
+            for record in records {
+                batch.push(record?);
+                if batch.len() == batch_size {
+                    let ready = std::mem::replace(&mut batch, Vec::with_capacity(batch_size));
+                    inputs[index % workers].send((index, ready))
+                        .map_err(|_| "Tag input channel disconnected".to_string())?;
+                    index += 1;
+                }
+            }
+            if !batch.is_empty() {
+                inputs[index % workers].send((index, batch))
+                    .map_err(|_| "Tag input channel disconnected".to_string())?;
+                index += 1;
+            }
+            Ok(index)
+        });
+
+        let mut expected = 0;
+        let written = (|| -> Result<(), String> {
+            // The first disconnected channel is EOF because dispatch is round-robin.
+            // Reader/worker joins below distinguish EOF from a failed stage.
+            while let Ok((index, batch)) = outputs[expected % workers].recv() {
+                if index != expected {
+                    return Err("Tag batch order mismatch".to_string());
+                }
+                for record in &batch {
+                    write(record)?;
+                }
+                expected += 1;
+            }
+            Ok(())
+        })();
+
+        // Release blocked sends before joining, including on a write failure.
+        drop(outputs);
+        let mut failure = written.err();
+        for handle in handles {
+            let result = handle.join()
+                .unwrap_or_else(|_| Err("Tag calculation worker panicked".to_string()));
+            if failure.is_none() {
+                failure = result.err();
+            }
+        }
+        match reader.join() {
+            Ok(Ok(dispatched)) => {
+                if failure.is_none() && dispatched != expected {
+                    failure = Some("Tag pipeline did not write every batch".to_string());
+                }
+            }
+            Ok(Err(error)) => {
+                if failure.is_none() {
+                    failure = Some(error);
+                }
+            }
+            Err(_) => {
+                if failure.is_none() {
+                    failure = Some("Tag reader thread panicked".to_string());
+                }
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    })
+}
+
+/// Stream ordered batches through XM workers and HTSlib compression workers.
 fn run_helper_mt(input: &str, output: &str, genome: &str, threads: usize) {
     let mut reader = bamutil::get_reader(input);
     let is_paired_end = bamutil::is_paired_end(input);
@@ -546,93 +670,44 @@ fn run_helper_mt(input: &str, output: &str, genome: &str, threads: usize) {
     }
     println!("Done!");
 
-    // Wrap read-only data in Arc for sharing across threads.
+    let (decompress, workers, compress, _) = thread_allocation(threads);
+    if decompress > 0 {
+        reader.set_threads(decompress).expect("Failed to set BAM decompression threads");
+    }
+    if compress > 0 {
+        writer.set_threads(compress).expect("Failed to set BAM compression threads");
+    }
+
     let refgenome = Arc::new(refgenome);
     let tid2size = Arc::new(tid2size);
     let rcmapping = Arc::new(rcmapping);
-
-    // Collect all records and payloads first.
-    // This is necessary because Record is not Clone/Send, so we extract payloads
-    // for workers and keep records for writing in correct order.
-    println!("Reading alignment records...");
-    let mut records: Vec<Record> = Vec::new();
-    let mut payloads: Vec<ReadPayload> = Vec::new();
-    for r in reader.records().map(|r| r.unwrap()) {
-        payloads.push(ReadPayload::from_record(&r));
-        records.push(r);
-    }
-    println!("Loaded {} records.", records.len());
-
-    let total_records = records.len();
-
-    // Create channels: workers receive Option<(usize, ReadPayload)>, send back (usize, String)
-    let mut txs: Vec<mpsc::SyncSender<Option<(usize, ReadPayload)>>> = Vec::with_capacity(threads);
-
-    let workers: Vec<thread::JoinHandle<Vec<(usize, String)>>> = (0..threads)
-        .map(|_| {
-            let (tx, rx) = mpsc::sync_channel::<Option<(usize, ReadPayload)>>(4);
-            txs.push(tx);
-            let refgenome = Arc::clone(&refgenome);
-            let tid2size = Arc::clone(&tid2size);
-            let rcmapping = Arc::clone(&rcmapping);
-            thread::spawn(move || {
-                let mut local_results: Vec<(usize, String)> = Vec::new();
-                while let Some((idx, payload)) = rx.recv().unwrap() {
-                    let xm_tag = compute_xm_tag_from_payload(
-                        &payload,
-                        &refgenome,
-                        &tid2size,
-                        &rcmapping,
-                        is_paired_end,
-                    );
-                    local_results.push((idx, xm_tag));
-                }
-                local_results
-            })
-        })
-        .collect();
-
-    // Dispatch work: round-robin distribution of payload indices.
-    let mut worker_idx: usize = 0;
-    for (i, payload) in payloads.into_iter().enumerate() {
-        txs[worker_idx]
-            .send(Some((i, payload)))
-            .expect("Error sending to worker thread");
-        worker_idx = (worker_idx + 1) % threads;
-    }
-
-    // Signal all workers to finish.
-    for tx in &txs {
-        tx.send(None).expect("Error sending termination signal");
-    }
-
-    // Collect results from all workers and place into ordered Vec.
-    let mut xm_tags: Vec<Option<String>> = vec![None; total_records];
-    for worker in workers {
-        let local_results = worker.join().expect("Worker thread panicked");
-        for (idx, xm_tag) in local_results {
-            xm_tags[idx] = Some(xm_tag);
-        }
-    }
-
-    // Apply XM tags to records in original order and write.
-    println!("Writing tagged records...");
-    for (i, mut r) in records.into_iter().enumerate() {
-        let xm_tag_string = xm_tags[i]
-            .as_ref()
-            .expect("Missing XM tag for record index");
-        let add_result = r.push_aux("XM".as_bytes(), Aux::String(xm_tag_string));
-        match add_result {
-            Ok(_) => (),
-            Err(e) => panic!("Error adding XM tag to alignment record. {}", e),
-        }
-        writer.write(&r).expect("Error writing to output file.");
-    }
+    let result = stream_batches(
+        reader.records().map(|r| r.map_err(|e| format!("Error reading BAM record: {}", e))),
+        workers,
+        BATCH_SIZE,
+        |record| {
+            let xm = determine_xm_tag_string(
+                record, &refgenome, &tid2size, &rcmapping, is_paired_end,
+            );
+            record.push_aux(b"XM", Aux::String(&xm))
+                .map_err(|e| format!("Error adding XM tag: {}", e))
+        },
+        |record| writer.write(record).map_err(|e| format!("Error writing BAM record: {}", e)),
+    );
+    // Finish HTSlib's background work before reporting completion.
+    drop(reader);
+    drop(writer);
+    result.unwrap_or_else(|error| panic!("{}", error));
     println!("Done writing!");
 }
 
 pub fn run(input: &str, output: &str, genome: &str, threads: usize) {
-    if threads <= 1 {
+    let (decompress, workers, compress, overhead) = thread_allocation(threads);
+    eprintln!(
+        "tag threads: budget={}, decompression={}, calculation={}, compression={}, main/I/O={}",
+        threads, decompress, workers, compress, overhead,
+    );
+    if threads <= 2 {
         run_helper(input, output, genome);
     } else {
         run_helper_mt(input, output, genome, threads);
@@ -651,9 +726,10 @@ mod tests {
     #[test]
     #[should_panic]
     fn error_when_output_directory_is_not_found() {
+        let dir = TestDir::new();
         run(
             "tests/test1.bam",
-            "tests/no_such_directory/out.bam",
+            dir.0.join("missing/out.bam").to_str().unwrap(),
             "tests/tinyref.fa",
             1,
         )
@@ -661,41 +737,166 @@ mod tests {
     #[test]
     #[should_panic]
     fn error_when_reference_genome_is_not_found() {
+        let dir = TestDir::new();
         run(
             "tests/test1.bam",
-            "tests/out.tagged.bam",
-            "tests/there_is_no_such.fa",
+            dir.0.join("out.bam").to_str().unwrap(),
+            dir.0.join("missing.fa").to_str().unwrap(),
             1,
         )
     }
 
+    struct TestDir(std::path::PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("metheor-tag-{}-{}", std::process::id(), id));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn record(index: usize) -> Record {
+        let mut r = Record::new();
+        r.set(
+            index.to_string().as_bytes(),
+            Some(&bam::record::CigarString(vec![Cigar::Match(8)])),
+            b"CGCGCGCG",
+            &[30; 8],
+        );
+        r.set_tid(0);
+        r.set_pos(((index % 80) * 2) as i64);
+        r.set_flags([99, 147, 83, 163][index % 4]);
+        r.set_mapq(30);
+        r.set_mtid(0);
+        r.set_mpos(r.pos() + 2);
+        r.set_insert_size(16);
+        r.push_aux(b"RG", Aux::String("test")).unwrap();
+        r
+    }
+
+    fn decoded(path: &std::path::Path) -> (Vec<u8>, Vec<Record>) {
+        let mut reader = bam::Reader::from_path(path).unwrap();
+        let header = reader.header().as_bytes().to_vec();
+        let records = reader.records().collect::<Result<Vec<_>, _>>().unwrap();
+        (header, records)
+    }
+
+    #[test]
+    fn test_thread_allocations() {
+        for budget in 1..=100 {
+            let (d, w, c, overhead) = thread_allocation(budget);
+            assert!(d + w + c + overhead <= budget);
+            if budget >= 3 {
+                assert_eq!(d + w + c + overhead, budget);
+                assert!(w > 0);
+            }
+            if budget >= 8 {
+                assert!(d > 0 && c > 0);
+                assert_eq!(overhead, 4);
+            }
+        }
+        assert_eq!(thread_allocation(100), (8, 44, 44, 4));
+    }
+
     #[test]
     fn test_mt_matches_st() {
-        // Verify that multi-threaded produces the same tagged BAM as single-threaded.
-        use std::process::Command;
-
-        let input = "tests/test1.bam";
-        let genome = "tests/tinyref.fa";
-
-        // Run single-threaded
-        run(input, "tests/out.tagged.bam", genome, 1);
-
-        // Run multi-threaded
-        run(input, "tests/out.tagged.mt.bam", genome, 4);
-
-        // Compare BAM files using samtools view
-        let st_output = Command::new("samtools")
-            .args(["view", "tests/out.tagged.bam"])
-            .output()
-            .expect("Failed to run samtools view on ST output");
-        let mt_output = Command::new("samtools")
-            .args(["view", "tests/out.tagged.mt.bam"])
-            .output()
-            .expect("Failed to run samtools view on MT output");
-
-        assert_eq!(
-            st_output.stdout, mt_output.stdout,
-            "Single-threaded and multi-threaded BAM outputs differ"
+        let dir = TestDir::new();
+        let input = dir.0.join("input.bam");
+        let genome = dir.0.join("ref.fa");
+        let st = dir.0.join("single.bam");
+        let mt = dir.0.join("parallel.bam");
+        std::fs::write(&genome, format!(">chr1\n{}\n", "CG".repeat(128))).unwrap();
+        std::fs::write(dir.0.join("ref.fa.fai"), "chr1\t256\t6\t256\t257\n").unwrap();
+        let mut header = bam::Header::new();
+        header.push_record(
+            bam::header::HeaderRecord::new(b"SQ").push_tag(b"SN", "chr1").push_tag(b"LN", 256),
         );
+
+        // Empty BAM, a partial batch, and multiple full batches plus a partial batch.
+        for count in [0, 7, BATCH_SIZE * 2 + 3] {
+            let mut writer = bam::Writer::from_path(&input, &header, bam::Format::Bam).unwrap();
+            for i in 0..count {
+                writer.write(&record(i)).unwrap();
+            }
+            drop(writer);
+            run(input.to_str().unwrap(), st.to_str().unwrap(), genome.to_str().unwrap(), 1);
+            let expected = decoded(&st);
+            assert_eq!(expected.1.len(), count);
+            for budget in [2, 3, 8, 16] {
+                run(input.to_str().unwrap(), mt.to_str().unwrap(), genome.to_str().unwrap(), budget);
+                assert_eq!(expected, decoded(&mt), "budget={}, records={}", budget, count);
+            }
+        }
+    }
+
+    #[test]
+    fn test_slow_first_worker_preserves_order() {
+        let mut written = Vec::new();
+        stream_batches(
+            (0..19).map(|i| Ok(record(i))),
+            3,
+            2,
+            |r| {
+                if r.qname() == b"0" {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Ok(())
+            },
+            |r| {
+                written.push(String::from_utf8(r.qname().to_vec()).unwrap());
+                Ok(())
+            },
+        ).unwrap();
+        assert_eq!(written, (0..19).map(|i| i.to_string()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_failures_disconnect_and_join() {
+        // A timeout makes a channel shutdown regression fail instead of hanging the suite.
+        for failure in ["read", "worker", "panic", "write"] {
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let result = stream_batches(
+                    (0..50).map(|i| {
+                        if failure == "read" && i == 9 {
+                            Err("injected read failure".to_string())
+                        } else {
+                            Ok(record(i))
+                        }
+                    }),
+                    3,
+                    2,
+                    |r| {
+                        if r.qname() == b"3" {
+                            if failure == "panic" {
+                                panic!("injected worker panic");
+                            }
+                            if failure == "worker" {
+                                return Err("injected worker failure".to_string());
+                            }
+                        }
+                        Ok(())
+                    },
+                    |_| {
+                        if failure == "write" {
+                            Err("injected write failure".to_string())
+                        } else {
+                            Ok(())
+                        }
+                    },
+                );
+                tx.send(result.is_err()).unwrap();
+            });
+            assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), "{}", failure);
+        }
     }
 }

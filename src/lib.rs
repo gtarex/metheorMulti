@@ -7,6 +7,16 @@ pub mod lpmd;
 pub mod progressbar;
 pub mod readutil;
 
+fn parse_thread_budget(value: &str) -> Result<usize, String> {
+    let threads = value
+        .parse::<usize>()
+        .map_err(|_| "threads must be an integer from 1 to 100".to_string())?;
+    if !(1..=100).contains(&threads) {
+        return Err("threads must be an integer from 1 to 100".to_string());
+    }
+    Ok(threads)
+}
+
 /// Summarizes the heterogeneity of DNA methylation states using BAM files.
 #[derive(Parser)]
 #[clap(name = "metheor")]
@@ -97,8 +107,14 @@ pub enum Commands {
         #[clap(long, short = 'c', required = false, display_order = 5)]
         cpg_set: Option<String>,
 
-        /// Number of worker threads for processing a single BAM (1 = single-threaded, same as original).
-        #[clap(long, short = 't', default_value_t = 1, display_order = 6)]
+        /// Maximum total process threads, including BAM I/O workers (1-100).
+        #[clap(
+            long,
+            short = 't',
+            default_value_t = 1,
+            value_parser = parse_thread_budget,
+            display_order = 6
+        )]
         threads: usize,
     },
     /// Compute fraction of discordant read pairs (FDRP).
@@ -233,8 +249,47 @@ pub enum Commands {
         #[clap(long, short = 'g', required = true, display_order = 3)]
         genome: String,
 
-        /// Number of worker threads for processing (1 = single-threaded, same as original).
-        #[clap(long, short = 't', default_value_t = 1, display_order = 4)]
+        /// Maximum total process threads, including BAM I/O workers (1-100).
+        #[clap(
+            long,
+            short = 't',
+            default_value_t = 1,
+            value_parser = parse_thread_budget,
+            display_order = 4
+        )]
         threads: usize,
     },
+}
+
+#[cfg(test)]
+mod thread_tests {
+    use super::*;
+
+    #[test]
+    fn thread_budget_cli() {
+        for command in ["tag", "me"] {
+            let mut args = vec!["metheor", command, "-i", "input.bam", "-o", "output"];
+            if command == "tag" {
+                args.extend(["-g", "reference.fa"]);
+            }
+            let cli = Cli::try_parse_from(&args).unwrap();
+            match cli.command {
+                Commands::Tag { threads, .. } | Commands::Me { threads, .. } => {
+                    assert_eq!(threads, 1);
+                }
+                _ => unreachable!(),
+            }
+            for budget in 1..=100 {
+                let value = budget.to_string();
+                let mut threaded_args = args.clone();
+                threaded_args.extend(["--threads", value.as_str()]);
+                assert!(Cli::try_parse_from(threaded_args).is_ok());
+            }
+            for value in ["0", "101", "-1", "abc"] {
+                let mut invalid_args = args.clone();
+                invalid_args.extend(["-t", value]);
+                assert!(Cli::try_parse_from(invalid_args).is_err());
+            }
+        }
+    }
 }
