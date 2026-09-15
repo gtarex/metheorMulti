@@ -8,96 +8,16 @@
 
 Compute DNA methylation heterogeneity levels from Bismark-aligned bisulfite sequencing data.
 
-## Modifications from the Original Metheor
+## Key Improvements and Bug Fixes
 
-1. **Parallel streaming for `tag` and `me`**: `-t` / `--threads` sets the total process thread budget, including calculation and BAM I/O workers (1–100; default 1).
-2. **Expanded output data**: The output file now includes 16 additional columns, detailing the read counts for each methylation condition.
+This repository extends the original [Metheor](https://github.com/dohlee/metheor) with multi-threading acceleration and key bug fixes:
 
-## V2 parallel streaming
-
-Process one sample directly from disk. Tagging uses batches of 8,192 records,
-one queued input batch and one queued result batch per calculation worker.
-XM calculation and tag attachment run in workers; a single ordered writer
-feeds HTSlib's parallel BGZF compression. The BAM header, record order, alignment
-fields and existing XM calculation are preserved. Compression settings are unchanged;
-compare decoded records rather than compressed-file checksums.
-
-ME dispatches the same-size raw batches to workers for XM parsing, filtering and
-quartet counting. Counts are combined across every batch and worker before the
-depth filter and entropy calculation. It retains the sorted 22-column text schema
-and writes through a 64 MiB buffer with a checked final flush. Overlapping paired
-reads remain separately counted. For BGI, depth is the sum of the 16 pattern counts
-for that exact four-CpG window after MAPQ filtering.
-
-### Thread budget
-
-`-t / --threads` now means the maximum **total process threads**, rather than the
-old number of calculation workers. Values outside 1–100 are rejected before output
-files are opened. Each command prints its allocation once at startup.
-The default stays at 1; existing scripts using `-t 1` do not automatically become parallel.
-
-At `-t 100`:
-
-| Command | Decompression | Calculation | Compression | Main and I/O | Total |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| tag | 8 | 44 | 44 | 4 | 100 |
-| me | 8 | 90 | — | 2 | 100 |
-
-For tag at T >= 8, reserve four threads (main writer, record reader, HTSlib input
-I/O and output I/O); R=T-4, D=min(8,max(1,floor(R/10))). Split R-D between
-compression and calculation, assigning any remainder to calculation. T=3–7 uses
-T-2 calculation workers with synchronous decompression/compression. T=1–2 uses
-the original single-thread streaming path.
-
-For me at T >= 4, reserve the main reader and HTSlib input I/O thread;
-D=min(8,max(1,floor((T-2)/10))), with T-2-D calculation workers. T=2–3 uses T-1
-calculation workers without background decompression. T=1 stays single-threaded.
-Allocations are upper bounds; a format that does not need background BGZF work
-may use fewer threads.
-
-### Direct-disk usage
-
-Run tag and me sequentially, with one sample at a time. Example commands for the
-user to run after compiling this source:
-
-```bash
-./target/release/metheor tag -i input.bam -o sample.tagged.bam -g reference.fa -t 100
-./target/release/metheor me -i sample.tagged.bam -o sample.me.txt -d 10 -q 10 -t 100
-```
-
-These examples do not use a target BED. Retain the tagged BAM. Production callers
-should keep their existing temporary-output staging and rename only after success.
-This source change does not edit BGI scripts or replace an installed binary.
-
-Batch buffering is bounded, but ME still retains worker-local quartet count maps
-and performs the final merge and sort. Its total memory depends on the dataset.
-BAM record parsing/serialization and disk bandwidth can still limit scaling;
-the allocations above are starting settings, with no guaranteed runtime or speedup.
-
-### Validation and benchmarking (user-run)
-
-The project execution policy leaves builds, tests and benchmarks to the user.
-From this source directory:
-
-```bash
-cargo build --release
-cargo test --lib thread_tests -- --test-threads=1
-cargo test --bin metheor tag::tests -- --test-threads=1
-cargo test --bin metheor me::tests -- --test-threads=1
-```
-
-Focused tests compare decoded tagged BAMs and complete entropy text with the
-single-thread path. They cover empty/partial/multiple batches, delayed workers,
-error shutdown, depth 9/10/11, MAPQ 9/10, target filtering, paired read counting,
-and allocation accounting for every supported budget. Test outputs use temporary
-directories; the tests do not require samtools or the full human reference genome.
-
-Before replacing an installed binary, compare the current and rebuilt V2 on the
-same BGI sample. Confirm identical decoded tagged records and entropy text.
-Then benchmark budgets 16, 32, 64 and 100 sequentially, recording elapsed time,
-CPU use, peak memory and disk throughput. Keep input, storage and cache conditions
-comparable. Use the fastest measured setting; a larger thread budget need not
-produce a shorter runtime.
+- **Multi-threading support (`-t, --threads`)**: High-performance parallel streaming execution for `tag` and `me` subcommands.
+- **Strand & coordinate determination fix**: Correctly determines strand using Bismark `XG` tags and bitwise SAM flags (preventing 1bp coordinate shifts and loss of CpG concordance caused by composite flags such as PCR duplicates or secondary alignments).
+- **CIGAR soft-clip & extended operations fix**: Properly handles leading/trailing soft-clips (`S`) and extended CIGAR operators (`=`, `X`) in `tag`, ensuring accurate coordinate alignment and XM string lengths matching read lengths.
+- **Direct reference context**: CpG/non-CpG methylation context is determined directly from consecutive genomic reference bases without artifactual indels.
+- **Thread safety & memory stability**: Safe concurrent tagging architecture with strict main-thread BAM record lifecycle, eliminating glibc heap corruption under high concurrency.
+- **Sorted & expanded output in `me`**: Outputs 16 additional columns detailing read counts for each 4-CpG methylation pattern (0000–1111), sorted deterministically by genomic coordinate.
 
 ## Motivation
 
@@ -106,11 +26,14 @@ We miss too much valuable clues about epigenetic ***stability*** and ***diversit
 We here provide an ultrafast, Rust-based bioinformatics tool for the computation of various intra-/inter-cellular methylation heterogeneity measures.
 
 ## Installation
-Install locally
-```
+
+Build from source with `cargo`:
+
+```bash
 cargo build --release
 ```
-The compiled binary will be at `target/release/metheor`
+
+The compiled binary will be located at `target/release/metheor`.
 
 ## Usage
 
@@ -271,7 +194,7 @@ metheor me --input <INPUT> --output <OUTPUT>
 - `-d, --min-depth`: Minimum depth of reads covering epialleles to consider. [default: 10]
 - `-q, --min-qual`: Minimum quality for a read to be considered. [default: 10]
 - `-c, --cpg-set`: (Optional) Specify a predefined set of CpGs (in BED file) to be analyzed.
-- `-t, --threads`: Maximum total process threads, including BAM I/O workers (1–100). [default: 1]
+- `-t, --threads`: Maximum total process threads, including BAM I/O workers (>= 1). [default: 1]
 
 *Output*
 
@@ -368,7 +291,7 @@ metheor tag --input <INPUT.bam> --output <OUTPUT.bam> --genome <GENOME.fa> --thr
 - `-i, --input`: Path to input BAM file.
 - `-o, --output`: Path to output BAM file tagged with XM tag.
 - `-g, --genome`: Path to genome fasta file.
-- `-t, --threads`: Maximum total process threads, including BAM I/O workers (1–100). [default: 1]
+- `-t, --threads`: Maximum total process threads, including BAM I/O workers (>= 1). [default: 1]
 
 ## Methylation heterogeneity profiles of 928 CCLE cell lines
 
