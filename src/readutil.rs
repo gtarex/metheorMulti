@@ -35,7 +35,8 @@ impl BismarkRead {
         match r.aux(b"XM") {
             Ok(value) => {
                 if let Aux::String(xm) = value {
-                    // if value is a type of Aux::String, run:
+                    assert!(xm.is_ascii() && xm.len() == r.seq_len(),
+                        "XM tag must contain one ASCII character per read base");
                     let cpgs = get_cpgs(r, xm);
                     Self {
                         start_pos,
@@ -320,20 +321,24 @@ impl Clone for CpGPosition {
     }
 }
 
+/// Use the same conversion strand for XM generation and CpG coordinates.
+/// Without XG, the flag fallback assumes a directional bisulfite library.
+pub fn is_top_strand(r: &Record) -> bool {
+    match r.aux(b"XG") {
+        Ok(Aux::String("CT")) => true,
+        Ok(Aux::String("GA")) => false,
+        Ok(_) => panic!("XG tag must be a string containing CT or GA"),
+        Err(_) if r.is_paired() => {
+            (!r.is_reverse() && r.is_first_in_template())
+                || (r.is_reverse() && r.is_last_in_template())
+        }
+        Err(_) => !r.is_reverse(),
+    }
+}
+
 fn get_cpgs(r: &Record, xm: &str) -> Vec<CpG> {
     let mut cpgs: Vec<CpG> = Vec::new();
-
-    // Determine strand orientation:
-    // 1. If Bismark's XG tag is present: "CT" = OT (Watson, top strand), "GA" = OB (Crick, bottom strand).
-    // 2. Otherwise fall back to bitwise flags (handles SE and PE, with any flag bits like duplicates):
-    let is_ot = if let Ok(Aux::String(xg)) = r.aux(b"XG") {
-        xg == "CT"
-    } else if r.is_paired() {
-        (!r.is_reverse() && r.is_first_in_template())
-            || (r.is_reverse() && r.is_last_in_template())
-    } else {
-        !r.is_reverse()
-    };
+    let is_ot = is_top_strand(r);
 
     for (relpos, (abspos, c)) in r.reference_positions_full().zip(xm.chars()).enumerate() {
         if (c != 'z') && (c != 'Z') {

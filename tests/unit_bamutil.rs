@@ -85,15 +85,6 @@ mod bamutil_tests {
     }
 
     #[test]
-    fn test_is_paired_end_detection() {
-        let is_paired = bamutil::is_paired_end("tests/test1.bam");
-
-        // This should return either true or false without panicking
-        // The exact value depends on the test data
-        assert!(matches!(is_paired, true | false));
-    }
-
-    #[test]
     fn test_round_trip_tid_chrom_conversion() {
         let reader = bamutil::get_reader("tests/test1.bam");
         let header = bamutil::get_header(&reader);
@@ -113,18 +104,6 @@ mod bamutil_tests {
 
         // BAM files should have at least one target sequence
         assert!(header.target_count() > 0);
-    }
-
-    #[test]
-    fn test_paired_end_with_multiple_files() {
-        // Test paired-end detection across different test BAM files
-        for i in 1..=6 {
-            let filename = format!("tests/test{}.bam", i);
-            let is_paired = bamutil::is_paired_end(&filename);
-
-            // Should not panic and should return a boolean
-            assert!(matches!(is_paired, true | false));
-        }
     }
 
     #[test]

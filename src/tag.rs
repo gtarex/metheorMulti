@@ -1,4 +1,4 @@
-use rust_htslib::faidx;
+use rust_htslib::{faidx, htslib};
 use rust_htslib::{
     bam,
     bam::ext::BamRecordExtensions,
@@ -6,7 +6,8 @@ use rust_htslib::{
     bam::Read,
 };
 use std::cmp::{max, min};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::ffi::CString;
 use std::path::PathBuf;
 use std::str;
 use std::sync::{mpsc, Arc};
@@ -20,10 +21,6 @@ fn reverse_complement(seq: &str, rcmapping: &HashMap<char, char>) -> String {
         res.push(rcmapping[&base]);
     }
     res
-}
-
-fn char_at(seq: &str, i: usize) -> char {
-    seq.chars().nth(i).unwrap()
 }
 
 fn is_chg_context(seq: &str) -> bool {
@@ -105,22 +102,35 @@ struct ReadPayload {
     reference_end: i64,
     seq_bytes: Vec<u8>,
     cigar_ops: Vec<Cigar>,
-    is_reverse: bool,
-    is_first_in_template: bool,
-    is_last_in_template: bool,
+    is_top_strand: bool,
+    is_unmapped: bool,
+    seq_len: usize,
 }
 
 impl ReadPayload {
     fn from_record(r: &Record) -> Self {
-        Self {
-            tid: r.tid(),
-            reference_start: r.reference_start(),
-            reference_end: r.reference_end(),
-            seq_bytes: r.seq().as_bytes().to_vec(),
-            cigar_ops: r.cigar().iter().copied().collect(),
-            is_reverse: r.is_reverse(),
-            is_first_in_template: r.is_first_in_template(),
-            is_last_in_template: r.is_last_in_template(),
+        if r.is_unmapped() {
+            Self {
+                tid: -1,
+                reference_start: -1,
+                reference_end: -1,
+                seq_bytes: Vec::new(),
+                cigar_ops: Vec::new(),
+                is_top_strand: true,
+                is_unmapped: true,
+                seq_len: r.seq_len(),
+            }
+        } else {
+            Self {
+                tid: r.tid(),
+                reference_start: r.reference_start(),
+                reference_end: r.reference_end(),
+                seq_bytes: r.seq().as_bytes().to_vec(),
+                cigar_ops: r.cigar().iter().copied().collect(),
+                is_top_strand: crate::readutil::is_top_strand(r),
+                is_unmapped: false,
+                seq_len: r.seq_len(),
+            }
         }
     }
 }
@@ -131,21 +141,15 @@ fn compute_xm_tag_from_payload(
     refgenome: &HashMap<usize, Vec<u8>>,
     tid2size: &HashMap<usize, usize>,
     rcmapping: &HashMap<char, char>,
-    is_paired_end: bool,
 ) -> String {
+    if payload.is_unmapped {
+        return ".".repeat(payload.seq_len);
+    }
     let tid = payload.tid;
     let start = payload.reference_start;
     let end = payload.reference_end;
 
-    // Reverse-complement decision (same logic as need_reverse_complement for paired-end,
-    // but extracting the needed flags from payload)
-    let flag_reverse_complement = match is_paired_end {
-        true => {
-            !((!payload.is_reverse && payload.is_first_in_template)
-                || (payload.is_reverse && payload.is_last_in_template))
-        }
-        false => payload.is_reverse,
-    };
+    let flag_reverse_complement = !payload.is_top_strand;
 
     // Extract read sequence from payload.
     let read_seq = match str::from_utf8(&payload.seq_bytes) {
@@ -176,256 +180,66 @@ fn compute_xm_tag_from_payload(
         padding[pad_nbases_start], ref_seq, padding[pad_nbases_end]
     );
 
-    // Separate leading and trailing soft-clips from aligned operations.
-    // Soft-clipped bases do not align to the reference genome and must be marked with '.' in XM.
-    // Keeping soft-clips separate prevents inserting '-' into the reference sequence,
-    // which would otherwise sever true adjacent CpG (CG) contexts at alignment boundaries.
-    let mut leading_clip: usize = 0;
-    let mut trailing_clip: usize = 0;
-    let mut aligned_cigar_ops: Vec<Cigar> = Vec::new();
+    // CIGAR maps read bases to genomic positions. Context always comes from
+    // adjacent reference bases, never from a reference with read gaps removed.
+    let read_bases = read_seq.as_bytes();
+    let mut xm = vec![b'.'; read_bases.len()];
+    let mut read_pos = 0usize;
+    // ref_seq has two upstream bases (or N padding) before the alignment.
+    let mut ref_pos = 2usize;
 
-    for &cigar in payload.cigar_ops.iter() {
-        match cigar {
-            Cigar::SoftClip(length) => {
-                if aligned_cigar_ops.is_empty() {
-                    leading_clip += length as usize;
-                } else {
-                    trailing_clip += length as usize;
-                }
-            }
-            Cigar::HardClip(_) => {}
-            other => {
-                aligned_cigar_ops.push(other);
-            }
-        }
-    }
-
-    if aligned_cigar_ops.is_empty() {
-        return std::iter::repeat('.').take(read_seq.len()).collect();
-    }
-
-    let aligned_read_seq = &read_seq[leading_clip..read_seq.len() - trailing_clip];
-
-    let mut tmp_read_seq: Vec<char> = Vec::new();
-    let mut tmp_ref_seq: Vec<char> = Vec::new();
-
-    tmp_read_seq.push('-');
-    tmp_read_seq.push('-');
-
-    tmp_ref_seq.push(ref_seq.chars().next().unwrap());
-    tmp_ref_seq.push(ref_seq.chars().nth(1).unwrap());
-
-    let mut used_read_len: usize = 0;
-    let mut used_ref_len: usize = 2;
-
-    for cigar in aligned_cigar_ops.iter() {
-        match cigar {
+    for cigar in &payload.cigar_ops {
+        match *cigar {
             Cigar::Match(length) | Cigar::Equal(length) | Cigar::Diff(length) => {
-                tmp_read_seq.append(
-                    &mut aligned_read_seq
-                        .chars()
-                        .skip(used_read_len)
-                        .take(*length as usize)
-                        .collect(),
-                );
-                tmp_ref_seq.append(
-                    &mut ref_seq
-                        .chars()
-                        .skip(used_ref_len)
-                        .take(*length as usize)
-                        .collect(),
-                );
-
-                used_read_len += *length as usize;
-                used_ref_len += *length as usize;
+                for offset in 0..length as usize {
+                    let query_pos = read_pos + offset;
+                    let genome_pos = ref_pos + offset;
+                    let base = match (flag_reverse_complement, read_bases[query_pos]) {
+                        (false, b'C') | (true, b'G') => b'C',
+                        (false, b'T') | (true, b'A') => b'T',
+                        _ => continue,
+                    };
+                    let context = if flag_reverse_complement {
+                        reverse_complement(&ref_seq[genome_pos - 2..genome_pos + 1], rcmapping)
+                    } else {
+                        ref_seq[genome_pos..genome_pos + 3].to_string()
+                    };
+                    if !context.starts_with('C') {
+                        continue;
+                    }
+                    let code = if context.starts_with("CG") {
+                        b'Z'
+                    } else if is_chg_context(&context) {
+                        b'X'
+                    } else if is_chh_context(&context) {
+                        b'H'
+                    } else if is_unknown_context(&context) {
+                        b'U'
+                    } else {
+                        // Ambiguous reference context: retain a dot at this base.
+                        b'.'
+                    };
+                    xm[query_pos] = if base == b'T' {
+                        code.to_ascii_lowercase()
+                    } else {
+                        code
+                    };
+                }
+                read_pos += length as usize;
+                ref_pos += length as usize;
             }
-            Cigar::Ins(length) => {
-                tmp_read_seq.append(
-                    &mut aligned_read_seq
-                        .chars()
-                        .skip(used_read_len)
-                        .take(*length as usize)
-                        .collect(),
-                );
-                tmp_ref_seq.extend(std::iter::repeat('-').take(*length as usize));
-
-                used_read_len += *length as usize;
+            Cigar::Ins(length) | Cigar::SoftClip(length) => {
+                // These read bases have no reference position; leave dots.
+                read_pos += length as usize;
             }
-            Cigar::Del(length) => {
-                tmp_read_seq.extend(std::iter::repeat('-').take(*length as usize));
-                tmp_ref_seq.append(
-                    &mut ref_seq
-                        .chars()
-                        .skip(used_ref_len)
-                        .take(*length as usize)
-                        .collect(),
-                );
-
-                used_ref_len += *length as usize;
+            Cigar::Del(length) | Cigar::RefSkip(length) => {
+                ref_pos += length as usize;
             }
-            _ => {}
+            Cigar::HardClip(_) | Cigar::Pad(_) => {}
         }
     }
-
-    tmp_read_seq.push('-');
-    tmp_read_seq.push('-');
-
-    tmp_ref_seq.push(ref_seq.chars().nth(ref_seq.len() - 2).unwrap());
-    tmp_ref_seq.push(ref_seq.chars().nth(ref_seq.len() - 1).unwrap());
-
-    let target_read_seq;
-    let target_ref_seq;
-
-    if flag_reverse_complement {
-        let read = tmp_read_seq
-            .iter()
-            .take(tmp_read_seq.len() - 2)
-            .collect::<String>();
-        let reference = tmp_ref_seq
-            .iter()
-            .take(tmp_ref_seq.len() - 2)
-            .collect::<String>();
-
-        target_read_seq = reverse_complement(&read, rcmapping);
-        target_ref_seq = reverse_complement(&reference, rcmapping);
-    } else {
-        target_read_seq = tmp_read_seq.iter().skip(2).collect::<String>();
-        target_ref_seq = tmp_ref_seq.iter().skip(2).collect::<String>();
-    }
-
-    let mut xm_tag: Vec<char> = Vec::new();
-    for idx in 0..target_read_seq.len() - 2 {
-        if char_at(&target_read_seq, idx) == '-' {
-            continue;
-        } else if char_at(&target_read_seq, idx) == 'N' {
-            xm_tag.push('.');
-        } else if char_at(&target_ref_seq, idx) == 'C' {
-            if (char_at(&target_read_seq, idx + 1) == '-'
-                || char_at(&target_read_seq, idx + 2) == '-')
-                && ((idx != target_read_seq.len() - 3) && (idx != target_read_seq.len() - 4))
-            {
-                let mut tmp_target_read_seq: Vec<char> = Vec::new();
-                let mut tmp_target_ref_seq: Vec<char> = Vec::new();
-
-                tmp_target_read_seq.push(char_at(&target_read_seq, idx));
-                tmp_target_ref_seq.push(char_at(&target_ref_seq, idx));
-
-                let mut flag_tmp = 0;
-                let mut tmp_count = 1;
-
-                while flag_tmp != 2 {
-                    if idx + tmp_count > target_read_seq.len() - 1 {
-                        break;
-                    }
-                    if char_at(&target_read_seq, idx + tmp_count) != '-' {
-                        tmp_target_read_seq.push(char_at(&target_read_seq, idx + tmp_count));
-                        tmp_target_ref_seq.push(char_at(&target_ref_seq, idx + tmp_count));
-                        flag_tmp += 1;
-                    }
-
-                    tmp_count += 1;
-                }
-
-                let ref_context = tmp_target_ref_seq.iter().collect::<String>();
-
-                if (tmp_target_ref_seq[0] == 'C') && (tmp_target_ref_seq[1] == 'G') {
-                    if tmp_target_read_seq[0] == 'C' {
-                        xm_tag.push('Z');
-                    } else if tmp_target_read_seq[0] == 'T' {
-                        xm_tag.push('z');
-                    } else {
-                        xm_tag.push('.');
-                    }
-                } else if is_chg_context(&ref_context) {
-                    if tmp_target_read_seq[0] == 'C' {
-                        xm_tag.push('X');
-                    } else if tmp_target_read_seq[0] == 'T' {
-                        xm_tag.push('x');
-                    } else {
-                        xm_tag.push('.');
-                    }
-                } else if is_chh_context(&ref_context) {
-                    if tmp_target_read_seq[0] == 'C' {
-                        xm_tag.push('H');
-                    } else if tmp_target_read_seq[0] == 'T' {
-                        xm_tag.push('h');
-                    } else {
-                        xm_tag.push('.');
-                    }
-                } else if is_unknown_context(&ref_context) {
-                    if tmp_target_read_seq[0] == 'C' {
-                        xm_tag.push('U');
-                    } else if tmp_target_read_seq[0] == 'T' {
-                        xm_tag.push('u');
-                    } else {
-                        xm_tag.push('.');
-                    }
-                }
-            }
-            // No deletion
-            else {
-                let ref_context = target_ref_seq.chars().skip(idx).take(3).collect::<String>();
-
-                if (char_at(&target_ref_seq, idx) == 'C')
-                    && (char_at(&target_ref_seq, idx + 1) == 'G')
-                {
-                    // Reference context is CG, read 'C' -> 'methylated in CG context (Z)'
-                    if char_at(&target_read_seq, idx) == 'C' {
-                        xm_tag.push('Z');
-                    }
-                    // Reference context is CG, read 'T' -> 'unmethylated in CG context (z)'
-                    else if char_at(&target_read_seq, idx) == 'T' {
-                        xm_tag.push('z');
-                    }
-                    // Reference context is CG, read 'A or G' -> Nothing.
-                    else {
-                        xm_tag.push('.');
-                    }
-                } else if is_chg_context(&ref_context) {
-                    if char_at(&target_read_seq, idx) == 'C' {
-                        xm_tag.push('X');
-                    } else if char_at(&target_read_seq, idx) == 'T' {
-                        xm_tag.push('x');
-                    } else {
-                        xm_tag.push('.');
-                    }
-                } else if is_chh_context(&ref_context) {
-                    if char_at(&target_read_seq, idx) == 'C' {
-                        xm_tag.push('H');
-                    } else if char_at(&target_read_seq, idx) == 'T' {
-                        xm_tag.push('h');
-                    } else {
-                        xm_tag.push('.');
-                    }
-                } else if is_unknown_context(&ref_context) {
-                    if char_at(&target_read_seq, idx) == 'C' {
-                        xm_tag.push('U');
-                    } else if char_at(&target_read_seq, idx) == 'T' {
-                        xm_tag.push('u');
-                    } else {
-                        xm_tag.push('.');
-                    }
-                }
-            }
-        } else {
-            xm_tag.push('.');
-        }
-    }
-
-    let aligned_xm: String = match flag_reverse_complement {
-        true => xm_tag.iter().rev().collect::<String>(),
-        false => xm_tag.iter().collect::<String>(),
-    };
-
-    let mut full_xm = String::with_capacity(read_seq.len());
-    for _ in 0..leading_clip {
-        full_xm.push('.');
-    }
-    full_xm.push_str(&aligned_xm);
-    for _ in 0..trailing_clip {
-        full_xm.push('.');
-    }
-    full_xm
+    assert_eq!(read_pos, read_bases.len(), "CIGAR/read length mismatch");
+    String::from_utf8(xm).expect("XM tags contain only ASCII characters")
 }
 
 /// Original determine_xm_tag_string (kept for backward compatibility and single-threaded path).
@@ -435,17 +249,86 @@ pub fn determine_xm_tag_string(
     refgenome: &HashMap<usize, Vec<u8>>,
     tid2size: &HashMap<usize, usize>,
     rcmapping: &HashMap<char, char>,
-    is_paired_end: bool,
+    _is_paired_end: bool,
 ) -> String {
+    // Unmapped records have no reference context, even if a mate position is set.
+    if r.is_unmapped() {
+        return ".".repeat(r.seq_len());
+    }
     let payload = ReadPayload::from_record(r);
-    compute_xm_tag_from_payload(&payload, refgenome, tid2size, rcmapping, is_paired_end)
+    compute_xm_tag_from_payload(&payload, refgenome, tid2size, rcmapping)
+}
+
+/// BAM output with a checked final close. rust-htslib's Writer only closes in
+/// Drop, which discards errors from the final BGZF flush and EOF write.
+struct CheckedBamWriter {
+    file: *mut htslib::htsFile,
+    header: bam::HeaderView,
+}
+
+impl CheckedBamWriter {
+    fn from_path(output: &str, header: &bam::Header) -> Result<Self, String> {
+        let path = CString::new(output).map_err(|e| format!("Invalid BAM output path: {}", e))?;
+        // Use the same header construction and default BAM compression as bam::Writer.
+        let header = bam::HeaderView::from_header(header);
+        // SAFETY: both strings are NUL-terminated; this writer owns the returned handle.
+        let file = unsafe { htslib::hts_open(path.as_ptr(), b"wb\0".as_ptr().cast()) };
+        if file.is_null() {
+            return Err(format!("Cannot open BAM output {}: {}", output, std::io::Error::last_os_error()));
+        }
+        let writer = Self { file, header };
+        // SAFETY: the file is open and the header remains owned by this writer.
+        if unsafe { htslib::sam_hdr_write(writer.file, writer.header.inner_ptr()) } < 0 {
+            return Err("Error writing BAM header".to_string());
+        }
+        Ok(writer)
+    }
+
+    fn set_threads(&mut self, threads: usize) -> Result<(), String> {
+        if threads == 0 || threads > std::os::raw::c_int::MAX as usize {
+            return Err("Invalid BAM compression thread count".to_string());
+        }
+        // SAFETY: the handle is open and the worker count fits HTSlib's integer type.
+        if unsafe { htslib::hts_set_threads(self.file, threads as std::os::raw::c_int) } != 0 {
+            return Err("Failed to set BAM compression threads".to_string());
+        }
+        Ok(())
+    }
+
+    fn write(&mut self, record: &Record) -> Result<(), String> {
+        // SAFETY: the writer, header and borrowed record all remain valid for this call.
+        if unsafe { htslib::sam_write1(self.file, self.header.inner_ptr(), record.inner()) } < 0 {
+            return Err("Error writing BAM record".to_string());
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(), String> {
+        // hts_close consumes the handle even on failure. Clear it before closing
+        // so Drop cannot close it again; the header stays alive through the call.
+        let file = std::mem::replace(&mut self.file, std::ptr::null_mut());
+        // SAFETY: this is the single close of our owned, open handle.
+        if unsafe { htslib::hts_close(file) } != 0 {
+            return Err(format!("Error finalizing BAM output: {}", std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CheckedBamWriter {
+    fn drop(&mut self) {
+        if !self.file.is_null() {
+            // Fallback cleanup on an earlier error/panic. Success paths use finish().
+            // SAFETY: a non-null handle here has not yet been closed.
+            unsafe { htslib::hts_close(self.file); }
+        }
+    }
 }
 
 /// Single-threaded implementation. Reads BAM, processes each record sequentially,
 /// writes output BAM with XM tag.
 fn run_helper(input: &str, output: &str, genome: &str) {
     let mut reader = bamutil::get_reader(input);
-    let is_paired_end = bamutil::is_paired_end(input);
     let header = bamutil::get_header(&reader);
     let tid2size: HashMap<usize, usize> = get_tid2size_from_bam(input);
 
@@ -463,7 +346,7 @@ fn run_helper(input: &str, output: &str, genome: &str) {
     }
     // Prepare output writer.
     let header_tmpl = get_header_template_from_bam(input);
-    let mut writer = match bam::Writer::from_path(output, &header_tmpl, bam::Format::Bam) {
+    let mut writer = match CheckedBamWriter::from_path(output, &header_tmpl) {
         Ok(writer) => writer,
         Err(error) => panic!("Error opening alignment file to write: {}", error),
     };
@@ -490,8 +373,11 @@ fn run_helper(input: &str, output: &str, genome: &str) {
     for mut r in reader.records().map(|r| r.unwrap()) {
         // Determine XM tag string by comparing read sequence and reference sequence.
         let xm_tag_string =
-            determine_xm_tag_string(&r, &refgenome, &tid2size, &rcmapping, is_paired_end);
+            determine_xm_tag_string(&r, &refgenome, &tid2size, &rcmapping, r.is_paired());
         // Attach XM tag to the record.
+        if r.aux(b"XM").is_ok() {
+            r.remove_aux(b"XM").expect("Error replacing existing XM tag");
+        }
         let add_result = r.push_aux("XM".as_bytes(), Aux::String(&xm_tag_string));
         match add_result {
             Ok(_) => (),
@@ -500,13 +386,14 @@ fn run_helper(input: &str, output: &str, genome: &str) {
         // Write record to output.
         writer.write(&r).expect("Error writing to output file.");
     }
+    writer.finish().unwrap_or_else(|error| panic!("{}", error));
 }
 
 const BATCH_SIZE: usize = 8192;
 
 // Decompression, calculation, compression, main/I/O threads.
 fn thread_allocation(threads: usize) -> (usize, usize, usize, usize) {
-    assert!((1..=100).contains(&threads), "threads must be from 1 to 100");
+    assert!(threads >= 1, "threads must be at least 1");
     match threads {
         1..=2 => (0, 0, 0, 1),
         3..=7 => (0, threads - 2, 0, 2),
@@ -521,6 +408,7 @@ fn thread_allocation(threads: usize) -> (usize, usize, usize, usize) {
 
 /// One bounded input/output channel per worker; consume in dispatch order.
 /// Record ownership moves between stages, with no whole-file accumulation.
+#[cfg(test)]
 fn stream_batches<I, F, W>(
     records: I,
     workers: usize,
@@ -627,10 +515,171 @@ where
     })
 }
 
+/// Stream ordered batches through XM calculation workers without crossing BAM records across threads.
+/// Record creation, modification, writing, and dropping remain strictly confined to the main I/O thread.
+fn stream_tag_records(
+    reader: &mut bam::Reader,
+    writer: &mut CheckedBamWriter,
+    refgenome: &Arc<HashMap<usize, Vec<u8>>>,
+    tid2size: &Arc<HashMap<usize, usize>>,
+    rcmapping: &Arc<HashMap<char, char>>,
+    workers: usize,
+    batch_size: usize,
+) -> Result<(), String> {
+    assert!(workers > 0 && batch_size > 0);
+    thread::scope(|scope| {
+        let mut inputs = Vec::with_capacity(workers);
+        let mut outputs = Vec::with_capacity(workers);
+        let mut handles = Vec::with_capacity(workers);
+
+        for _ in 0..workers {
+            let (input_tx, input_rx) = mpsc::sync_channel::<(usize, Vec<ReadPayload>)>(1);
+            let (output_tx, output_rx) = mpsc::sync_channel::<(usize, Vec<String>)>(1);
+            inputs.push(input_tx);
+            outputs.push(output_rx);
+            let refgenome = Arc::clone(refgenome);
+            let tid2size = Arc::clone(tid2size);
+            let rcmapping = Arc::clone(rcmapping);
+            handles.push(scope.spawn(move || -> Result<(), String> {
+                while let Ok((index, payloads)) = input_rx.recv() {
+                    let mut tags = Vec::with_capacity(payloads.len());
+                    for payload in &payloads {
+                        tags.push(compute_xm_tag_from_payload(
+                            payload,
+                            &refgenome,
+                            &tid2size,
+                            &rcmapping,
+                        ));
+                    }
+                    output_tx
+                        .send((index, tags))
+                        .map_err(|_| "Tag output channel disconnected".to_string())?;
+                }
+                Ok(())
+            }));
+        }
+
+        let max_in_flight = workers.max(1) * 2;
+        let mut in_flight: VecDeque<(usize, Vec<Record>)> = VecDeque::new();
+        let mut dispatched = 0usize;
+        let mut expected = 0usize;
+        let mut current_batch = Vec::with_capacity(batch_size);
+
+        let write_next_batch = |expected_idx: usize,
+                                in_flight: &mut VecDeque<(usize, Vec<Record>)>,
+                                outputs: &[mpsc::Receiver<(usize, Vec<String>)>],
+                                writer: &mut CheckedBamWriter|
+         -> Result<(), String> {
+            let (index, tags) = outputs[expected_idx % workers]
+                .recv()
+                .map_err(|_| "Tag output channel disconnected unexpectedly".to_string())?;
+            if index != expected_idx {
+                return Err(format!(
+                    "Tag batch order mismatch: expected {}, got {}",
+                    expected_idx, index
+                ));
+            }
+            let (rec_index, mut records) = in_flight
+                .pop_front()
+                .ok_or_else(|| "In-flight record queue underflow".to_string())?;
+            if rec_index != expected_idx {
+                return Err(format!(
+                    "Record batch order mismatch: expected {}, got {}",
+                    expected_idx, rec_index
+                ));
+            }
+            if records.len() != tags.len() {
+                return Err(format!(
+                    "Batch length mismatch: {} records vs {} tags",
+                    records.len(),
+                    tags.len()
+                ));
+            }
+            for (record, xm) in records.iter_mut().zip(&tags) {
+                if record.aux(b"XM").is_ok() {
+                    record
+                        .remove_aux(b"XM")
+                        .map_err(|e| format!("Error replacing XM tag: {}", e))?;
+                }
+                record
+                    .push_aux(b"XM", Aux::String(xm))
+                    .map_err(|e| format!("Error adding XM tag: {}", e))?;
+                writer
+                    .write(record)
+                    .map_err(|e| format!("Error writing BAM record: {}", e))?;
+            }
+            Ok(())
+        };
+
+        let run_res = (|| -> Result<(), String> {
+            for record_res in reader.records() {
+                let record = record_res.map_err(|e| format!("Error reading BAM record: {}", e))?;
+                current_batch.push(record);
+
+                if current_batch.len() == batch_size {
+                    while in_flight.len() >= max_in_flight {
+                        write_next_batch(expected, &mut in_flight, &outputs, writer)?;
+                        expected += 1;
+                    }
+                    let batch_records =
+                        std::mem::replace(&mut current_batch, Vec::with_capacity(batch_size));
+                    let payloads: Vec<ReadPayload> =
+                        batch_records.iter().map(ReadPayload::from_record).collect();
+                    inputs[dispatched % workers]
+                        .send((dispatched, payloads))
+                        .map_err(|_| "Tag input channel disconnected".to_string())?;
+                    in_flight.push_back((dispatched, batch_records));
+                    dispatched += 1;
+                }
+            }
+
+            if !current_batch.is_empty() {
+                while in_flight.len() >= max_in_flight {
+                    write_next_batch(expected, &mut in_flight, &outputs, writer)?;
+                    expected += 1;
+                }
+                let batch_records = current_batch;
+                let payloads: Vec<ReadPayload> =
+                    batch_records.iter().map(ReadPayload::from_record).collect();
+                inputs[dispatched % workers]
+                    .send((dispatched, payloads))
+                    .map_err(|_| "Tag input channel disconnected".to_string())?;
+                in_flight.push_back((dispatched, batch_records));
+                dispatched += 1;
+            }
+
+            while expected < dispatched {
+                write_next_batch(expected, &mut in_flight, &outputs, writer)?;
+                expected += 1;
+            }
+
+            Ok(())
+        })();
+
+        // Drop inputs to signal workers to terminate gracefully.
+        drop(inputs);
+
+        // Join workers and collect any error
+        let mut failure = run_res.err();
+        for handle in handles {
+            let res = handle
+                .join()
+                .unwrap_or_else(|_| Err("Tag calculation worker panicked".to_string()));
+            if failure.is_none() {
+                failure = res.err();
+            }
+        }
+
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    })
+}
+
 /// Stream ordered batches through XM workers and HTSlib compression workers.
 fn run_helper_mt(input: &str, output: &str, genome: &str, threads: usize) {
     let mut reader = bamutil::get_reader(input);
-    let is_paired_end = bamutil::is_paired_end(input);
     let header = bamutil::get_header(&reader);
     let tid2size: HashMap<usize, usize> = get_tid2size_from_bam(input);
 
@@ -648,7 +697,7 @@ fn run_helper_mt(input: &str, output: &str, genome: &str, threads: usize) {
     }
     // Prepare output writer.
     let header_tmpl = get_header_template_from_bam(input);
-    let mut writer = match bam::Writer::from_path(output, &header_tmpl, bam::Format::Bam) {
+    let mut writer = match CheckedBamWriter::from_path(output, &header_tmpl) {
         Ok(writer) => writer,
         Err(error) => panic!("Error opening alignment file to write: {}", error),
     };
@@ -681,23 +730,20 @@ fn run_helper_mt(input: &str, output: &str, genome: &str, threads: usize) {
     let refgenome = Arc::new(refgenome);
     let tid2size = Arc::new(tid2size);
     let rcmapping = Arc::new(rcmapping);
-    let result = stream_batches(
-        reader.records().map(|r| r.map_err(|e| format!("Error reading BAM record: {}", e))),
+    let result = stream_tag_records(
+        &mut reader,
+        &mut writer,
+        &refgenome,
+        &tid2size,
+        &rcmapping,
         workers,
         BATCH_SIZE,
-        |record| {
-            let xm = determine_xm_tag_string(
-                record, &refgenome, &tid2size, &rcmapping, is_paired_end,
-            );
-            record.push_aux(b"XM", Aux::String(&xm))
-                .map_err(|e| format!("Error adding XM tag: {}", e))
-        },
-        |record| writer.write(record).map_err(|e| format!("Error writing BAM record: {}", e)),
     );
     // Finish HTSlib's background work before reporting completion.
     drop(reader);
-    drop(writer);
+    let finished = writer.finish();
     result.unwrap_or_else(|error| panic!("{}", error));
+    finished.unwrap_or_else(|error| panic!("{}", error));
     println!("Done writing!");
 }
 
@@ -717,6 +763,8 @@ pub fn run(input: &str, output: &str, genome: &str, threads: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    include!("tag_context_tests.rs");
 
     #[test]
     fn test_reverse_complement() {
@@ -791,8 +839,64 @@ mod tests {
     }
 
     #[test]
+    fn test_checked_writer_matches_bam_writer() {
+        let dir = TestDir::new();
+        let original = dir.0.join("original.bam");
+        let checked = dir.0.join("checked.bam");
+        let mut header = bam::Header::new();
+        header.push_record(
+            bam::header::HeaderRecord::new(b"HD").push_tag(b"VN", "1.6").push_tag(b"SO", "unsorted"),
+        );
+        header.push_record(
+            bam::header::HeaderRecord::new(b"SQ").push_tag(b"SN", "chr1").push_tag(b"LN", 256),
+        );
+        header.push_record(
+            bam::header::HeaderRecord::new(b"RG").push_tag(b"ID", "test").push_tag(b"SM", "sample"),
+        );
+        header.push_record(
+            bam::header::HeaderRecord::new(b"PG").push_tag(b"ID", "test").push_tag(b"PN", "metheor"),
+        );
+        // Empty output and enough records to span several BGZF blocks.
+        for count in [0, 2049] {
+            for threads in [0, 2] {
+                let mut expected = bam::Writer::from_path(&original, &header, bam::Format::Bam).unwrap();
+                let mut actual = CheckedBamWriter::from_path(checked.to_str().unwrap(), &header).unwrap();
+                if threads > 0 {
+                    expected.set_threads(threads).unwrap();
+                    actual.set_threads(threads).unwrap();
+                }
+                for i in 0..count {
+                    let mut r = record(i);
+                    r.push_aux(b"XM", Aux::String("ZzZzZzZz")).unwrap();
+                    expected.write(&r).unwrap();
+                    actual.write(&r).unwrap();
+                }
+                drop(expected);
+                actual.finish().unwrap();
+                let expected = decoded(&original);
+                assert_eq!(expected.1.len(), count);
+                assert_eq!(expected, decoded(&checked), "threads={}, records={}", threads, count);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_checked_writer_reports_final_flush_failure() {
+        let mut header = bam::Header::new();
+        header.push_record(
+            bam::header::HeaderRecord::new(b"SQ").push_tag(b"SN", "chr1").push_tag(b"LN", 256),
+        );
+        // The small header/record fit in the buffers; /dev/full fails at final flush.
+        let mut writer = CheckedBamWriter::from_path("/dev/full", &header).unwrap();
+        writer.write(&record(0)).unwrap();
+        let error = writer.finish().unwrap_err();
+        assert!(error.contains("Error finalizing BAM output"), "{}", error);
+    }
+
+    #[test]
     fn test_thread_allocations() {
-        for budget in 1..=100 {
+        for budget in 1..=256 {
             let (d, w, c, overhead) = thread_allocation(budget);
             assert!(d + w + c + overhead <= budget);
             if budget >= 3 {
@@ -805,6 +909,7 @@ mod tests {
             }
         }
         assert_eq!(thread_allocation(100), (8, 44, 44, 4));
+        assert_eq!(thread_allocation(128), (8, 58, 58, 4));
     }
 
     #[test]

@@ -66,3 +66,104 @@ To compile release binary:
 Copy to test path:
     cp /mnt/md128/liyy/work/ageMethy2026/code/metheorMultiV2/target/release/metheor /home/liyy/localTools/metheorV2/metheor
 ================================================================================
+
+5. V3 REFERENCE-CONTEXT FIX (2026-09-14)
+--------------------------------------------------------------------------------
+The V2 sections above describe earlier changes. V3 now assigns XM context from
+consecutive genomic reference bases instead of constructing context across read
+deletions or insertions. For example, CAGT aligned to C-GT remains CHG (X/x),
+not CpG (Z/z). Existing strand selection and reference-coordinate conventions
+are retained. Inserted/soft-clipped bases receive dots; deletions/reference skips
+advance only the reference cursor. XM retains one character per read base.
+
+Files:
+- src/tag.rs: replace gap-dependent context reconstruction with CIGAR position
+  mapping and direct reference-context lookup; shared by both tagging paths.
+- src/tag_context_tests.rs: expected tags for indels, both strands and mate
+  orientations, clipping, extended CIGAR operations, ambiguous bases and genome
+  boundaries; CpG coordinate checks; false-quartet regression; a small real
+  BAM -> tag -> me regression with expected positions, counts and entropy.
+
+Validation status: source reviewed only; tests and compilation were NOT run.
+User-run checks from /mnt/md126/liyy/tools/metheorMultiV3:
+    cargo test --bin metheor reference_context -- --test-threads=1
+    cargo test --bin metheor tag::tests -- --test-threads=1
+    cargo test --bin metheor me::tests -- --test-threads=1
+    cargo build --release
+
+This source update does not replace /home/liyy/localTools/metheorMultiV3/metheor.
+
+
+6. V3 STRAND AND INPUT-RECORD CORRECTNESS (2026-09-14)
+--------------------------------------------------------------------------------
+- XM generation and CpG coordinate extraction now share is_top_strand().
+  XG:Z:CT/GA takes precedence; without XG, use each record's flags under the
+  existing directional-library assumption. The first BAM record no longer
+  determines paired-end handling for every record. Reject invalid XG values.
+- tag assigns dots to unmapped records and replaces existing XM tags when
+  explicitly re-tagging. me excludes unmapped records in both counting paths.
+- Reject non-ASCII or length-mismatched XM strings instead of silently
+  truncating CpG extraction through zip().
+- The four-CpG entropy formula, read-level counting (including overlapping
+  mates), MAPQ threshold, merged-count depth threshold, and 22 columns are
+  unchanged. CpG context remains based on the reference genome.
+
+Independent tests were added to src/tag_context_tests.rs:
+- All 16 patterns with explicit XM, coordinate and pattern-index expectations;
+  single/paired reads, both strands, extra flag bits, XG overrides.
+- Malformed XM/XG rejection, re-tagging, unmapped and mixed-pairing input.
+- BAM -> tag -> me with fixed expected counts and entropies 0, 0.25, 0.5,
+  0.2028195311147832 (3:1 mixture), and 1 (uniform over 16 patterns).
+  The uniform case has 8208 reads, crossing the 8192-record batch boundary.
+  Both single-thread and multi-thread outputs are checked against these
+  expectations, not against V2 or against each other alone.
+
+Validation status of THIS update: patch checks and static review only.
+No compilation, test execution, or installed-binary replacement was performed.
+The installed executable must be rebuilt before these changes take effect.
+Bounded user-run checks (from this source directory):
+    cargo test --release --offline -j 2 --bin metheor me::tests -- --test-threads=1
+    cargo test --release --offline -j 2 --bin metheor readutil::tests -- --test-threads=1
+    cargo test --release --offline -j 2 --bin metheor tag::tests -- --test-threads=1
+    cargo build --release --offline -j 2
+
+These checks use small fixtures, not production BAMs. Passing them establishes
+the specified cases, not a guarantee for arbitrary inputs. The older
+V2-concordance report is not a ground-truth test for the reference-context change.
+
+================================================================================
+7. V4 MULTI-THREADING HEAP SAFETY FIX (2026-09-14)
+================================================================================
+Target: metheorMultiV4
+
+Problem:
+In V3, running `metheor tag` with high thread counts (e.g. -t 120) caused:
+`malloc_consolidate(): unaligned fastbin chunk detected` and SIGABRT (core dump).
+Root cause:
+In `run_helper_mt`, `stream_batches` sent `Vec<Record>` batches across 54 worker
+threads. In `rust-htslib`, `Record` contains `header: Option<Rc<HeaderView>>`.
+`Rc` has a non-atomic reference count (`std::rc::Rc`), violating Send/Sync
+thread-safety under concurrency. Additionally, concurrent calls to C HTSlib
+memory reallocation (`bam_aux_del` / `bam_aux_append`) across 54 worker threads
+corrupted glibc heap metadata (fastbin chunks).
+
+Fix in src/tag.rs:
+1. `Record` lifecycle is strictly confined to the main I/O thread.
+   `Record` creation, XM modification (`remove_aux` / `push_aux`), BAM writing,
+   and deallocation are exclusively performed on the single main thread.
+2. Worker threads only receive pure Rust `Vec<ReadPayload>` (no C pointers, no `Rc`,
+   Send + Sync) and compute/return `Vec<String>` (XM tag strings).
+3. An ordered sliding window pipeline (`stream_tag_records`) coordinates batches:
+   dispatching payloads round-robin to workers, while draining and writing
+   completed batches in strict original BAM order.
+4. Glibc heap corruption is completely eliminated because C BAM structures and
+   refcounted headers are never shared across threads.
+
+Build commands for the user:
+    cd /mnt/md126/liyy/tools/metheorMultiV4
+    cargo test --release --offline -j 2 --bin metheor tag::tests -- --test-threads=1
+    cargo build --release --offline
+    mkdir -p /home/liyy/localTools/metheorMultiV4
+    cp target/release/metheor /home/liyy/localTools/metheorMultiV4/metheor
+================================================================================
+

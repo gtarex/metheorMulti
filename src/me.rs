@@ -81,7 +81,7 @@ const OUTPUT_BUFFER_SIZE: usize = 64 * 1024 * 1024;
 
 // Decompression, calculation, main/I/O threads.
 fn thread_allocation(threads: usize) -> (usize, usize, usize) {
-    assert!((1..=100).contains(&threads), "threads must be from 1 to 100");
+    assert!(threads >= 1, "threads must be at least 1");
     match threads {
         1 => (0, 0, 1),
         2..=3 => (0, threads - 1, 1),
@@ -149,7 +149,7 @@ pub fn compute(
     out.flush().expect("Error flushing entropy output.");
 }
 
-/// Original single-threaded implementation (unchanged, used when threads <= 1).
+/// Single-threaded reference implementation, used when threads <= 1.
 pub fn compute_helper(
     input: &str,
     min_qual: u8,
@@ -167,6 +167,9 @@ pub fn compute_helper(
     let bar = progressbar::ProgressBar::new();
 
     for r in reader.records().map(|r| r.unwrap()) {
+        if r.is_unmapped() {
+            continue;
+        }
         let mut br = readutil::BismarkRead::new(&r);
 
         if let Some(target_cpgs) = target_cpgs {
@@ -216,6 +219,9 @@ where
                 let mut local_map: HashMap<readutil::Quartet, QuartetStat> = HashMap::new();
                 while let Ok(batch) = rx.recv() {
                     for record in batch {
+                        if record.is_unmapped() {
+                            continue;
+                        }
                         // Preserve the single-thread path's parsing/filter order.
                         let mut br = readutil::BismarkRead::new(&record);
                         if let Some(target) = target_cpgs {
@@ -416,7 +422,7 @@ mod tests {
 
     #[test]
     fn test_thread_allocations() {
-        for budget in 1..=100 {
+        for budget in 1..=256 {
             let (d, w, overhead) = thread_allocation(budget);
             assert_eq!(d + w + overhead, budget);
             if budget > 1 {
@@ -428,6 +434,7 @@ mod tests {
             }
         }
         assert_eq!(thread_allocation(100), (8, 90, 2));
+        assert_eq!(thread_allocation(128), (8, 118, 2));
     }
 
     struct TestDir(std::path::PathBuf);
